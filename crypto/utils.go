@@ -1,4 +1,4 @@
-package query
+package crypto
 
 import (
 	"context"
@@ -8,37 +8,69 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/dyaksa/encryption-pii/crypto"
 	"github.com/dyaksa/encryption-pii/crypto/hmacx"
 	"github.com/dyaksa/encryption-pii/crypto/types"
+	"github.com/dyaksa/encryption-pii/validate/nik"
+	"github.com/dyaksa/encryption-pii/validate/npwp"
+	"github.com/dyaksa/encryption-pii/validate/phone"
 	"github.com/google/uuid"
 )
 
-// Deprecated: any is deprecated. Use interface{} instead.
+type Entity interface{}
+
+type Database interface {
+	QueryContext(ctx context.Context, query string, args ...interface{}) (*sql.Rows, error)
+}
+
+func QueryContext[D Database, T Entity](ctx context.Context, db D, baseQuery string, queryParams []interface{}, iOptInitFunc func(*T), IOptInitValue func(T)) (t []T, err error) {
+	rows, err := db.QueryContext(ctx, baseQuery, queryParams...)
+	if err != nil {
+		return
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var i T
+		if iOptInitFunc != nil {
+			iOptInitFunc(&i)
+		}
+
+		colums := structToInterfaceScan(&i)
+		err = rows.Scan(colums...)
+
+		if err != nil {
+			return
+		}
+
+		if IOptInitValue != nil {
+			IOptInitValue(i)
+		}
+
+		t = append(t, i)
+	}
+	return
+}
+
 type FindTextHeapByHashParams struct {
 	Hash string
 }
 
-// Deprecated: any is deprecated. Use interface{} instead.
 type FindTextHeapRow struct {
 	ID      uuid.UUID
 	Content string
 	Hash    string
 }
 
-// Deprecated: any is deprecated. Use interface{} instead.
 type FindTextHeapByContentParams struct {
 	Content string
 }
 
-// Deprecated: any is deprecated. Use interface{} instead.
 type TextHeap struct {
 	Content string
 	Type    string
 	Hash    string
 }
 
-// Deprecated: any is deprecated. Use interface{} instead.
 func BuildQueryLike(ctx context.Context, tx *sql.Tx, data any, cond string) (str string, err error) {
 	entityValue := reflect.ValueOf(data)
 	entityType := entityValue.Type()
@@ -80,7 +112,6 @@ func BuildQueryLike(ctx context.Context, tx *sql.Tx, data any, cond string) (str
 	return
 }
 
-// Deprecated: any is deprecated. Use interface{} instead.
 func GenerateSQLConditions(data any) (strs []string) {
 	entityValue := reflect.ValueOf(data)
 	entityType := entityValue.Type()
@@ -100,8 +131,70 @@ func GenerateSQLConditions(data any) (strs []string) {
 	return
 }
 
+type ResultHeap struct {
+	Column string `json:"column"`
+	Value  string `json:"value"`
+}
+
+func (c *Crypto) BindHeap(entity any) (err error) {
+	entityPtrValue := reflect.ValueOf(entity)
+	if entityPtrValue.Kind() != reflect.Ptr {
+		return fmt.Errorf("entity harus berupa pointer")
+	}
+
+	entityValue := entityPtrValue.Elem()
+	entityType := entityValue.Type()
+
+	for i := 0; i < entityType.NumField(); i++ {
+		field := entityType.Field(i)
+		if _, ok := field.Tag.Lookup("txt_heap_table"); ok {
+			plainTextFieldName := field.Name[:len(field.Name)-4]
+			bidxField := entityValue.FieldByName(field.Name)
+			txtHeapTable := field.Tag.Get("txt_heap_table")
+
+			switch originalValue := entityValue.FieldByName(plainTextFieldName).Interface().(type) {
+			case types.AESChiper:
+				str, heaps := c.buildHeap(originalValue.To(), txtHeapTable)
+				err = c.saveToHeap(context.Background(), c.dbHeapPsql, heaps)
+				if err != nil {
+					return fmt.Errorf("failed to save to heap: %w", err)
+				}
+				bidxField.SetString(str)
+			}
+		}
+	}
+	return nil
+}
+
+func (c *Crypto) saveToHeap(ctx context.Context, db *sql.DB, textHeaps []TextHeap) (err error) {
+	for _, th := range textHeaps {
+		query := new(strings.Builder)
+		query.WriteString("INSERT INTO ")
+		query.WriteString(th.Type)
+		query.WriteString(" (content, hash) VALUES ($1, $2)")
+		if ok, _ := isHashExist(ctx, db, th.Type, FindTextHeapByHashParams{Hash: th.Hash}); !ok {
+			_, err = db.ExecContext(ctx, query.String(), th.Content, th.Hash)
+		}
+	}
+	return
+}
+
+func (c *Crypto) buildHeap(value string, typeHeap string) (s string, th []TextHeap) {
+	var values = split(value)
+	builder := new(strings.Builder)
+	for _, value := range values {
+		builder.WriteString(hmacx.HMACHash(c.HMACFunc(), value).Hash().ToLast8DigitValue())
+		th = append(th, TextHeap{
+			Content: strings.ToLower(value),
+			Type:    typeHeap,
+			Hash:    hmacx.HMACHash(c.HMACFunc(), value).Hash().ToLast8DigitValue(),
+		})
+	}
+	return builder.String(), th
+}
+
 // Deprecated: any is deprecated. Use interface{} instead.
-func InsertWithHeap[T Entity](c *crypto.Crypto, ctx context.Context, tx *sql.Tx, tableName string, entity any, generic T) (a T, err error) {
+func InsertWithHeap[T Entity](c *Crypto, ctx context.Context, tx *sql.Tx, tableName string, entity any, generic T) (a T, err error) {
 	entityValue := reflect.ValueOf(entity)
 	entityType := entityValue.Type()
 	var fieldNames []string
@@ -164,7 +257,7 @@ func InsertWithHeap[T Entity](c *crypto.Crypto, ctx context.Context, tx *sql.Tx,
 
 			switch fieldValue := entityValue.Field(i).Interface().(type) {
 			case types.AESChiper:
-				str, heaps := BuildHeap(c, fieldValue.To(), field.Tag.Get("txt_heap_table"))
+				str, heaps := buildHeap(c, fieldValue.To(), field.Tag.Get("txt_heap_table"))
 				th = append(th, heaps...)
 				args = append(args, str)
 			}
@@ -173,6 +266,11 @@ func InsertWithHeap[T Entity](c *crypto.Crypto, ctx context.Context, tx *sql.Tx,
 	}
 
 	query := fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s) RETURNING id", tableName, strings.Join(fieldNames, ", "), strings.Join(placeholders, ", "))
+
+	err = saveToHeap(ctx, c.dbHeapPsql, th)
+	if err != nil {
+		return a, fmt.Errorf("failed to save to heap please check heap db connection: %w", err)
+	}
 
 	stmt, err := tx.PrepareContext(ctx, query)
 	if err != nil {
@@ -185,15 +283,11 @@ func InsertWithHeap[T Entity](c *crypto.Crypto, ctx context.Context, tx *sql.Tx,
 		return a, fmt.Errorf("failed to execute statement: %w", err)
 	}
 
-	err = SaveToHeap(ctx, tx, th)
-	if err != nil {
-		return a, fmt.Errorf("failed to save to heap: %w", err)
-	}
 	return a, nil
 }
 
 // Deprecated: any is deprecated. Use interface{} instead.
-func UpdateWithHeap(c *crypto.Crypto, ctx context.Context, tx *sql.Tx, tableName string, entity any, id string) error {
+func UpdateWithHeap(c *Crypto, ctx context.Context, tx *sql.Tx, tableName string, entity any, id string) error {
 	entityValue := reflect.ValueOf(entity)
 	entityType := entityValue.Type()
 
@@ -257,7 +351,7 @@ func UpdateWithHeap(c *crypto.Crypto, ctx context.Context, tx *sql.Tx, tableName
 
 			switch fieldValue := entityValue.Field(i).Interface().(type) {
 			case types.AESChiper:
-				str, heaps := BuildHeap(c, fieldValue.To(), field.Tag.Get("txt_heap_table"))
+				str, heaps := buildHeap(c, fieldValue.To(), field.Tag.Get("txt_heap_table"))
 				th = append(th, heaps...)
 				args = append(args, str)
 			}
@@ -283,7 +377,7 @@ func UpdateWithHeap(c *crypto.Crypto, ctx context.Context, tx *sql.Tx, tableName
 		return fmt.Errorf("failed to execute statement: %w", err)
 	}
 
-	err = SaveToHeap(ctx, tx, th)
+	err = saveToHeap(ctx, c.dbHeapPsql, th)
 	if err != nil {
 		return fmt.Errorf("failed to save to heap: %w", err)
 	}
@@ -291,16 +385,11 @@ func UpdateWithHeap(c *crypto.Crypto, ctx context.Context, tx *sql.Tx, tableName
 	return nil
 }
 
-// Deprecated: any is deprecated. Use interface{} instead.
-type Entity interface{}
-
-// Deprecated: any is deprecated. Use interface{} instead.
 type ILikeParams struct {
 	ColumnHeap string
 	Hash       []string
 }
 
-// Deprecated: any is deprecated. Use interface{} instead.
 func QueryLike[T Entity](ctx context.Context, basQuery string, tx *sql.Tx, iOptionalFilter func(*ILikeParams), iOptInitFunc func(*T)) (t []T, err error) {
 	var args []interface{}
 	if iOptionalFilter != nil {
@@ -340,8 +429,7 @@ func QueryLike[T Entity](ctx context.Context, basQuery string, tx *sql.Tx, iOpti
 	return
 }
 
-// Deprecated: any is deprecated. Use interface{} instead.
-func BuildHeap(c *crypto.Crypto, value string, typeHeap string) (s string, th []TextHeap) {
+func buildHeap(c *Crypto, value string, typeHeap string) (s string, th []TextHeap) {
 	var values = split(value)
 	builder := new(strings.Builder)
 	for _, value := range values {
@@ -355,7 +443,6 @@ func BuildHeap(c *crypto.Crypto, value string, typeHeap string) (s string, th []
 	return builder.String(), th
 }
 
-// Deprecated: any is deprecated. Use interface{} instead.
 func SearchContents(ctx context.Context, tx *sql.Tx, table string, args FindTextHeapByContentParams) (heaps []string, err error) {
 	var query = new(strings.Builder)
 	query.WriteString("SELECT content, hash FROM ")
@@ -382,27 +469,25 @@ func SearchContents(ctx context.Context, tx *sql.Tx, table string, args FindText
 	return
 }
 
-// Deprecated: any is deprecated. Use interface{} instead.
-func SaveToHeap(ctx context.Context, tx *sql.Tx, textHeaps []TextHeap) (err error) {
+func saveToHeap(ctx context.Context, db *sql.DB, textHeaps []TextHeap) (err error) {
 	for _, th := range textHeaps {
 		query := new(strings.Builder)
 		query.WriteString("INSERT INTO ")
 		query.WriteString(th.Type)
 		query.WriteString(" (content, hash) VALUES ($1, $2)")
-		if ok, _ := isHashExist(ctx, tx, th.Type, FindTextHeapByHashParams{Hash: th.Hash}); !ok {
-			_, err = tx.ExecContext(ctx, query.String(), th.Content, th.Hash)
+		if ok, _ := isHashExist(ctx, db, th.Type, FindTextHeapByHashParams{Hash: th.Hash}); !ok {
+			_, err = db.ExecContext(ctx, query.String(), th.Content, th.Hash)
 		}
 	}
 	return
 }
 
-// Deprecated: any is deprecated. Use interface{} instead.
-func isHashExist(ctx context.Context, tx *sql.Tx, typeHeap string, args FindTextHeapByHashParams) (bool, error) {
+func isHashExist(ctx context.Context, db *sql.DB, typeHeap string, args FindTextHeapByHashParams) (bool, error) {
 	var query = new(strings.Builder)
 	query.WriteString("SELECT hash FROM ")
 	query.WriteString(typeHeap)
 	query.WriteString(" WHERE hash = $1")
-	row := tx.QueryRowContext(ctx, query.String(), args.Hash)
+	row := db.QueryRowContext(ctx, query.String(), args.Hash)
 	var i FindTextHeapRow
 	err := row.Scan(&i.Hash)
 	if err != nil {
@@ -414,13 +499,27 @@ func isHashExist(ctx context.Context, tx *sql.Tx, typeHeap string, args FindText
 	return false, nil
 }
 
-// Deprecated: any is deprecated. Use interface{} instead.
 func split(value string) (s []string) {
 	var sep = " "
 	reg := "[a-zA-Z0-9]+"
 	regex := regexp.MustCompile(reg)
-	if validateEmail(value) {
+	switch {
+	case validateEmail(value):
 		sep = "@"
+	case phone.IsValid((value)):
+		parse, err := phone.Parse(value)
+		if err != nil {
+			return
+		}
+		value = parse.ToString()
+		sep = "-"
+	case nik.IsValid((value)) || npwp.IsValid((value)):
+		parse, err := nik.Parse(value)
+		if err != nil {
+			return
+		}
+		value = parse.ToString()
+		sep = "."
 	}
 	parts := strings.Split(value, sep)
 	for _, part := range parts {
@@ -431,7 +530,6 @@ func split(value string) (s []string) {
 	return
 }
 
-// Deprecated: any is deprecated. Use interface{} instead.
 func validateEmail(email string) bool {
 	// Define the email regex pattern
 	const emailRegexPattern = `^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$`
@@ -443,7 +541,6 @@ func validateEmail(email string) bool {
 	return re.MatchString(email)
 }
 
-// Deprecated: any is deprecated. Use interface{} instead.
 func buildLikeQuery(column, baseQuery string, terms []string) (string, []interface{}) {
 	var likeClauses []string
 	var args []interface{}
@@ -456,4 +553,15 @@ func buildLikeQuery(column, baseQuery string, terms []string) (string, []interfa
 	fullQuery := fmt.Sprintf("%s WHERE %s", baseQuery, strings.Join(likeClauses, " OR "))
 
 	return fullQuery, args
+}
+
+func structToInterfaceScan(v interface{}) []interface{} {
+	s := reflect.ValueOf(v).Elem()
+	numCols := s.NumField()
+	columns := make([]interface{}, numCols)
+	for i := 0; i < numCols; i++ {
+		field := s.Field(i)
+		columns[i] = field.Addr().Interface()
+	}
+	return columns
 }
