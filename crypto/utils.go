@@ -35,7 +35,7 @@ func QueryContext[D Database, T Entity](ctx context.Context, db D, baseQuery str
 			iOptInitFunc(&i)
 		}
 
-		colums := structToInterfaceScan(&i)
+		colums := StructToInterfaceScan(&i)
 		err = rows.Scan(colums...)
 
 		if err != nil {
@@ -153,7 +153,7 @@ func (c *Crypto) BindHeap(entity any) (err error) {
 			txtHeapTable := field.Tag.Get("txt_heap_table")
 
 			switch originalValue := entityValue.FieldByName(plainTextFieldName).Interface().(type) {
-			case types.AESChiper:
+			case types.AESCipher:
 				str, heaps := c.buildHeap(originalValue.To(), txtHeapTable)
 				err = c.saveToHeap(context.Background(), c.dbHeapPsql, heaps)
 				if err != nil {
@@ -164,6 +164,38 @@ func (c *Crypto) BindHeap(entity any) (err error) {
 		}
 	}
 	return nil
+}
+
+func (c *Crypto) SearchContents(ctx context.Context, table string, args func(*FindTextHeapByContentParams)) (heaps []string, err error) {
+	var query = new(strings.Builder)
+	query.WriteString("SELECT content, hash FROM ")
+	query.WriteString(table)
+	query.WriteString(" WHERE content LIKE $1")
+
+	var params FindTextHeapByContentParams
+	if args != nil {
+		args(&params)
+	}
+
+	rows, err := c.dbHeapPsql.QueryContext(ctx, query.String(), "%"+strings.ToLower(params.Content)+"%")
+	if err != nil {
+		return
+	}
+	defer rows.Close()
+
+	seen := make(map[string]interface{})
+	for rows.Next() {
+		var i FindTextHeapRow
+		err = rows.Scan(&i.Content, &i.Hash)
+		if err != nil {
+			return
+		}
+		if _, exist := seen[i.Hash]; !exist {
+			heaps = append(heaps, i.Hash)
+			seen[i.Hash] = struct{}{}
+		}
+	}
+	return
 }
 
 func (c *Crypto) saveToHeap(ctx context.Context, db *sql.DB, textHeaps []TextHeap) (err error) {
@@ -194,7 +226,7 @@ func (c *Crypto) buildHeap(value string, typeHeap string) (s string, th []TextHe
 }
 
 // Deprecated: any is deprecated. Use interface{} instead.
-func InsertWithHeap[T Entity](c *Crypto, ctx context.Context, tx *sql.Tx, tableName string, entity any, generic T) (a T, err error) {
+func insertWithHeap[T Entity](c *Crypto, ctx context.Context, tx *sql.Tx, tableName string, entity any, generic T) (a T, err error) {
 	entityValue := reflect.ValueOf(entity)
 	entityType := entityValue.Type()
 	var fieldNames []string
@@ -256,7 +288,7 @@ func InsertWithHeap[T Entity](c *Crypto, ctx context.Context, tx *sql.Tx, tableN
 			placeholders = append(placeholders, "$"+fmt.Sprint(len(placeholders)+1))
 
 			switch fieldValue := entityValue.Field(i).Interface().(type) {
-			case types.AESChiper:
+			case types.AESCipher:
 				str, heaps := buildHeap(c, fieldValue.To(), field.Tag.Get("txt_heap_table"))
 				th = append(th, heaps...)
 				args = append(args, str)
@@ -287,7 +319,7 @@ func InsertWithHeap[T Entity](c *Crypto, ctx context.Context, tx *sql.Tx, tableN
 }
 
 // Deprecated: any is deprecated. Use interface{} instead.
-func UpdateWithHeap(c *Crypto, ctx context.Context, tx *sql.Tx, tableName string, entity any, id string) error {
+func updateWithHeap(c *Crypto, ctx context.Context, tx *sql.Tx, tableName string, entity any, id string) error {
 	entityValue := reflect.ValueOf(entity)
 	entityType := entityValue.Type()
 
@@ -350,7 +382,7 @@ func UpdateWithHeap(c *Crypto, ctx context.Context, tx *sql.Tx, tableName string
 			placeholders = append(placeholders, "$"+fmt.Sprint(len(placeholders)+1))
 
 			switch fieldValue := entityValue.Field(i).Interface().(type) {
-			case types.AESChiper:
+			case types.AESCipher:
 				str, heaps := buildHeap(c, fieldValue.To(), field.Tag.Get("txt_heap_table"))
 				th = append(th, heaps...)
 				args = append(args, str)
@@ -443,7 +475,8 @@ func buildHeap(c *Crypto, value string, typeHeap string) (s string, th []TextHea
 	return builder.String(), th
 }
 
-func SearchContents(ctx context.Context, tx *sql.Tx, table string, args FindTextHeapByContentParams) (heaps []string, err error) {
+// deprecated function
+func searchContents(ctx context.Context, tx *sql.Tx, table string, args FindTextHeapByContentParams) (heaps []string, err error) {
 	var query = new(strings.Builder)
 	query.WriteString("SELECT content, hash FROM ")
 	query.WriteString(table)
@@ -555,7 +588,7 @@ func buildLikeQuery(column, baseQuery string, terms []string) (string, []interfa
 	return fullQuery, args
 }
 
-func structToInterfaceScan(v interface{}) []interface{} {
+func StructToInterfaceScan(v interface{}) []interface{} {
 	s := reflect.ValueOf(v).Elem()
 	numCols := s.NumField()
 	columns := make([]interface{}, numCols)
