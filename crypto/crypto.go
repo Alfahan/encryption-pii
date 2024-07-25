@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/dyaksa/encryption-pii/cmd"
 	"github.com/dyaksa/encryption-pii/crypto/aesx"
 	"github.com/dyaksa/encryption-pii/crypto/core"
 	"github.com/dyaksa/encryption-pii/crypto/hmacx"
@@ -35,6 +34,26 @@ func isValidKeySize(key []byte) bool {
 	return false
 }
 
+type Opts func(*Crypto) error
+
+func WithInitHeapConnection() Opts {
+	return func(c *Crypto) error {
+		dsn := fmt.Sprintf("host=%s port=%s user=%s password=%s dbname=%s sslmode=disable",
+			*c.Host, *c.Port, *c.User, *c.Pass, *c.Name)
+		db, err := sql.Open("postgres", dsn)
+		if err != nil {
+			return err
+		}
+
+		if err := db.Ping(); err != nil {
+			return err
+		}
+
+		c.dbHeapPsql = db
+		return nil
+	}
+}
+
 type Crypto struct {
 	AESKey  *string `env:"AES_KEY,expand" json:"aes_key"`
 	HMACKey *string `env:"HMAC_KEY,expand" json:"hmac_key"`
@@ -53,13 +72,19 @@ type Crypto struct {
 	keySize AesKeySize
 }
 
-func New(keySize AesKeySize) (c *Crypto, err error) {
+func New(keySize AesKeySize, opts ...Opts) (c *Crypto, err error) {
 	c = &Crypto{
 		keySize: keySize,
 	}
 
 	if err = c.initEnv(); err != nil {
 		return nil, err
+	}
+
+	for _, opt := range opts {
+		if err = opt(c); err != nil {
+			return nil, err
+		}
 	}
 
 	if c.AESKey == nil || c.HMACKey == nil {
@@ -89,7 +114,7 @@ func (c *Crypto) InitHeapDatabase() (*sql.DB, error) {
 }
 
 func (c *Crypto) initEnv() error {
-	return cmd.EnvLoader(c, cmd.OptionsEnv{DotEnv: true, Prefix: "CRYPTO_"})
+	return envLoader(c, OptionsEnv{DotEnv: true, Prefix: "CRYPTO_"})
 }
 
 func (c *Crypto) initAES() {
